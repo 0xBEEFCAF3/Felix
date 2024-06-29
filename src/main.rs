@@ -6,7 +6,7 @@ use bitcoincore_rpc::{Auth, Client as BitcoinRpc, RpcApi};
 use ciborium;
 use clap::Parser;
 
-use log::info;
+use log::{info, trace};
 use sled::Db;
 
 const OP_CAT: u8 = 0x7e;
@@ -42,8 +42,11 @@ struct Args {
     #[arg(long, default_value = "193536")]
     start_block: u64,
 
-    #[arg(long)]
+    #[arg(long, default_value = "false")]
     start_index: bool,
+
+    #[arg(long, default_value = "false")]
+    get_checkpoint: bool,
 }
 
 struct App {
@@ -67,7 +70,7 @@ impl App {
         Self {
             bitcoind_rpc,
             start_block: args.start_block,
-            db: sled::open("felix_signet_db").expect("open db"),
+            db: sled::open("db").expect("open db"),
         }
     }
 
@@ -78,6 +81,7 @@ impl App {
 
         // get checkpoint
         let checkpoint = self.retrieve_check_point()?;
+        info!("Current checkpoint height: {}", checkpoint);
 
         for height in checkpoint..index_till {
             let block = self.bitcoind_rpc.get_block_hash(height)?;
@@ -113,8 +117,6 @@ impl App {
         let mut map =
             ciborium::from_reader::<HashMap<u64, Vec<Transaction>>, _>(current_txs.as_ref())?;
 
-
-
         let mut binding = map.clone();
         let txs = binding.entry(height).or_insert_with(Vec::new);
         txs.push(tx);
@@ -124,15 +126,18 @@ impl App {
     }
 
     fn parse_block(&mut self, height: u64, block: Block) -> Result<()> {
+        info!("parsing block height: {}", height);
+        let mut cat_count = 0;
         block.txdata.iter().for_each(|tx| {
             tx.input.iter().for_each(|input| {
                 if !input.witness.is_empty() && witness_includes_cat(&input.witness) {
-                    log::info!("found cat witness in tx: {}", tx.compute_txid());
+                    trace!("found cat in witness for txid: {}", tx.compute_txid());
                     let _ = self.insert_tx(height, tx.clone());
+                    cat_count += 1;
                 }
             })
         });
-
+        info!("block height: {}, cat txs: {}", height, cat_count);
         Ok(())
     }
 }
@@ -143,8 +148,9 @@ fn witness_includes_cat(witness: &Witness) -> bool {
 
 fn main() {
     env_logger::builder()
-        .filter_level(log::LevelFilter::Trace)
+        .filter_level(log::LevelFilter::Info)
         .filter_module("sled::", log::LevelFilter::Info)
+        .filter_module("bitcoincore_rpc::", log::LevelFilter::Info)
         .init();
 
     info!(">>>>> starting indexer");
@@ -152,5 +158,10 @@ fn main() {
     let mut app = App::new(args.clone());
     if args.start_index {
         app.start_index().expect("start indexing");
+    } else if args.get_checkpoint {
+        let checkpoint = app.retrieve_check_point().expect("get checkpoint");
+        let tip = app.bitcoind_rpc.get_block_count().expect("get block count");
+        info!("checkpoint: {}", checkpoint);
+        info!("tip: {}", tip);
     }
 }
