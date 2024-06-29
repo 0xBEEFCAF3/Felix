@@ -1,19 +1,18 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use anyhow::Result;
 use bitcoin::{Block, Transaction, Witness};
-use bitcoincore_rpc::{Auth, Client as BitcoinRpc, RpcApi};
+use bitcoincore_rpc::{Auth, Client as BitcoinRpc, RawTx, RpcApi};
 use ciborium;
 use clap::Parser;
 
 use log::{info, trace};
 use sled::Db;
 
+/// OP_CAT in hex
 const OP_CAT: u8 = 0x7e;
-
+/// Sled key for checkpoint
 const CHECKPOINT_SLED_KEY: &str = "CHECKPOINT";
-const TXS_SLED_KEY: &str = "TRANSACTIONS";
-
 /// tip - BLOCK_DEPTH is when the indexer will stop indexing
 /// even signet reorgs
 const BLOCK_DEPTH: u64 = 6;
@@ -47,6 +46,9 @@ struct Args {
 
     #[arg(long, default_value = "false")]
     get_checkpoint: bool,
+
+    #[arg(long, default_value = "false")]
+    get_total_cat_txs: bool,
 }
 
 struct App {
@@ -113,32 +115,58 @@ impl App {
     }
 
     fn insert_tx(&mut self, height: u64, tx: Transaction) -> Result<()> {
-        let current_txs = self.db.get(TXS_SLED_KEY)?.unwrap_or_default();
-        let mut map =
-            ciborium::from_reader::<HashMap<u64, Vec<Transaction>>, _>(current_txs.as_ref())?;
+        let mut set = {
+            if let Some(current_txs) = self.db.get(height.to_string())? {
+                let map = ciborium::from_reader::<HashSet<Transaction>, _>(current_txs.as_ref())?;
+                map
+            } else {
+                HashSet::new()
+            }
+        };
 
-        let mut binding = map.clone();
-        let txs = binding.entry(height).or_insert_with(Vec::new);
-        txs.push(tx);
-        map.insert(height, txs.clone());
+        set.insert(tx);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&set, &mut bytes)?;
+        self.db.insert(height.to_string(), bytes)?;
 
         Ok(())
     }
 
     fn parse_block(&mut self, height: u64, block: Block) -> Result<()> {
         info!("parsing block height: {}", height);
+        info!("total txs in block: {}", block.txdata.len());
         let mut cat_count = 0;
         block.txdata.iter().for_each(|tx| {
-            tx.input.iter().for_each(|input| {
-                if !input.witness.is_empty() && witness_includes_cat(&input.witness) {
-                    trace!("found cat in witness for txid: {}", tx.compute_txid());
-                    let _ = self.insert_tx(height, tx.clone());
-                    cat_count += 1;
-                }
-            })
+            // Convert the entire transaction to raw hex and check of CAT usage
+            // there could be other 7e's in there but this will filter out most of txs
+            // that dont contain cat
+            let raw_hex = tx.raw_hex();
+            if raw_hex.contains(&OP_CAT.to_string()) {
+                // info!("total inputs in tx: {}", tx.input.len());
+                tx.input.iter().for_each(|input| {
+                    if !input.witness.is_empty() && witness_includes_cat(&input.witness) {
+                        trace!("found cat in witness for txid: {}", tx.compute_txid());
+                        let _ = self.insert_tx(height, tx.clone()).expect("to insert tx");
+                        cat_count += 1;
+                    }
+                })
+            }
         });
         info!("block height: {}, cat txs: {}", height, cat_count);
         Ok(())
+    }
+
+    fn get_total_cat_txs(&self) -> Result<u64> {
+        let mut total_cats = 0;
+        let starting_height = self.start_block;
+        let tip = self.bitcoind_rpc.get_block_count()? - BLOCK_DEPTH;
+        for i in starting_height..tip {
+            if let Some(txs) = self.db.get(i.to_string())? {
+                let set = ciborium::from_reader::<HashSet<Transaction>, _>(txs.as_ref())?;
+                total_cats += set.len() as u64;
+            }
+        }
+        Ok(total_cats)
     }
 }
 
@@ -153,7 +181,6 @@ fn main() {
         .filter_module("bitcoincore_rpc::", log::LevelFilter::Info)
         .init();
 
-    info!(">>>>> starting indexer");
     let args = Args::parse();
     let mut app = App::new(args.clone());
     if args.start_index {
@@ -163,5 +190,8 @@ fn main() {
         let tip = app.bitcoind_rpc.get_block_count().expect("get block count");
         info!("checkpoint: {}", checkpoint);
         info!("tip: {}", tip);
+    } else if args.get_total_cat_txs {
+        let total_cats = app.get_total_cat_txs().expect("get total cat txs");
+        info!("total cat txs: {}", total_cats);
     }
 }
