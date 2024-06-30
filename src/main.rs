@@ -1,17 +1,14 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use bitcoin::{Block, Transaction, Witness};
-use bitcoincore_rpc::{Auth, Client as BitcoinRpc, RawTx, RpcApi};
+use bitcoin::{Block, Script, Transaction, Witness};
+use bitcoincore_rpc::{Auth, Client as BitcoinRpc, RpcApi};
 use ciborium;
 use clap::Parser;
+use log::info;
 use plotters::prelude::*;
-
-use log::{info, trace};
 use sled::Db;
 
-/// OP_CAT in hex
-const OP_CAT: u8 = 0x7e;
 /// Sled key for checkpoint
 const CHECKPOINT_SLED_KEY: &str = "CHECKPOINT";
 /// tip - BLOCK_DEPTH is when the indexer will stop. This is to avoid reorgs
@@ -42,6 +39,10 @@ struct Args {
     #[arg(long, default_value = "193536")]
     start_block: u64,
 
+    /// db path
+    #[arg(long, default_value = "db")]
+    db_path: String,
+
     #[arg()]
     command: String,
 }
@@ -63,11 +64,11 @@ impl App {
         .expect("connect to bitcoind");
         // test the connection
         bitcoind_rpc.get_block_count().expect("get block count");
-
+        info!("opening db at: {}", args.db_path);
         Self {
             bitcoind_rpc,
             start_block: args.start_block,
-            db: sled::open("db").expect("open db"),
+            db: sled::open(args.db_path).expect("open db"),
         }
     }
 
@@ -133,22 +134,23 @@ impl App {
         info!("parsing block height: {}", height);
         info!("total txs in block: {}", block.txdata.len());
         let mut cat_count = 0;
-        block.txdata.iter().for_each(|tx| {
-            // Convert the entire transaction to raw hex and check of CAT usage
-            // there could be other 7e's in there but this will filter out most of txs
-            // that dont contain cat
-            let raw_hex = tx.raw_hex();
-            if raw_hex.contains(&OP_CAT.to_string()) {
-                // info!("total inputs in tx: {}", tx.input.len());
-                tx.input.iter().for_each(|input| {
-                    if !input.witness.is_empty() && witness_includes_cat(&input.witness) {
-                        trace!("found cat in witness for txid: {}", tx.compute_txid());
+        for tx in block.txdata.iter() {
+            for input in tx.input.iter() {
+                if witness_includes_cat(&input.witness) {
+                    // Double check that the prevout is a P2TR
+                    let prevout = self
+                        .bitcoind_rpc
+                        .get_raw_transaction(&input.previous_output.txid, None)?;
+                    let prev_output = prevout.output[input.previous_output.vout as usize].clone();
+                    let script_pubkey = prev_output.script_pubkey.clone();
+                    if script_pubkey.is_p2tr() {
+                        info!("found cat in witness for txid: {}", tx.compute_txid());
                         let _ = self.insert_tx(height, tx.clone()).expect("to insert tx");
                         cat_count += 1;
                     }
-                })
+                }
             }
-        });
+        }
         info!("block height: {}, cat txs: {}", height, cat_count);
         Ok(())
     }
@@ -166,13 +168,15 @@ impl App {
         Ok(total_cats)
     }
 
-    fn get_cats_starting_from(&self, height: u64) -> Result<Vec<u64>> {
+    /// Return a vector of tuples of block height and total cat txs for that block
+    fn get_cats_in_range(&self, start: u64, finish: u64) -> Result<Vec<(i32, i32)>> {
         let mut total_cats = vec![];
-        let tip = self.bitcoind_rpc.get_block_count()? - BLOCK_DEPTH;
-        for i in height..tip {
+        for i in start..finish {
             if let Some(txs) = self.db.get(i.to_string())? {
                 let set = ciborium::from_reader::<HashSet<Transaction>, _>(txs.as_ref())?;
-                total_cats.push(set.len() as u64);
+                total_cats.push((i as i32, set.len() as i32));
+            } else {
+                total_cats.push((i as i32, 0));
             }
         }
         Ok(total_cats)
@@ -181,15 +185,15 @@ impl App {
     fn create_plots(&self) -> Result<()> {
         let tip = self.bitcoind_rpc.get_block_count()? - BLOCK_DEPTH;
         let height_range = (self.start_block as i32)..(tip as i32);
-        let total_cats = self.get_cats_starting_from(self.start_block)?;
-        let root = BitMapBackend::new("output/total_cat_txs.png", (640, 480)).into_drawing_area();
+        let total_cats = self.get_cats_in_range(self.start_block, tip)?;
+        let root = BitMapBackend::new("output/total_cat_txs.png", (1500, 800)).into_drawing_area();
         root.fill(&WHITE)?;
         let mut chart = ChartBuilder::on(&root)
             .caption("CATS over time", ("sans-serif", 50).into_font())
             .margin(10)
             .x_label_area_size(30)
             .y_label_area_size(40)
-            .build_cartesian_2d(height_range.clone(), 0..1000)?;
+            .build_cartesian_2d(height_range.clone(), 0..300)?;
 
         chart
             .configure_mesh()
@@ -197,16 +201,8 @@ impl App {
             .y_desc("txs using CAT")
             .draw()?;
 
-        let binding = total_cats.iter().map(|c| *c as i32).collect::<Vec<i32>>();
-        let heights = height_range.clone().into_iter().collect::<Vec<i32>>();
-        let cats_to_plot: Vec<(i32, i32)> = binding
-            .iter()
-            .zip(heights.iter())
-            .map(|(c, h)| (*h, *c))
-            .collect();
-
         chart
-            .draw_series(LineSeries::new(cats_to_plot, &RED))?
+            .draw_series(LineSeries::new(total_cats, &RED))?
             .label("Txs using CAT")
             .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
 
@@ -222,7 +218,14 @@ impl App {
 }
 
 fn witness_includes_cat(witness: &Witness) -> bool {
-    witness.iter().any(|w| w.iter().any(|b| b == &OP_CAT))
+    // get the second to last element in the witness which should be the tapscript
+    // ignoring all annex things
+    if witness.len() <= 2 {
+        return false;
+    }
+
+    let tapscript = Script::from_bytes(witness.nth(witness.len() - 2).expect("witness"));
+    tapscript.to_asm_string().contains("OP_CAT")
 }
 
 fn main() {
@@ -235,8 +238,24 @@ fn main() {
     let args = Args::parse();
     let mut app = App::new(args.clone());
 
+    // let tx = app
+    //     .bitcoind_rpc
+    //     .get_raw_transaction(
+    //         &Txid::from_str("f7db5fd1d1355448dfb0f4b956257b65e648855ba89d74f7e5dded3f7d7eec91")
+    //             .unwrap(),
+    //         None,
+    //     )
+    //     .expect("get tx");
+
+    // let witness = tx.input[0].witness.clone();
+    // let res = witness_includes_cat(&witness);
+    // println!("{:?}", res);
+
+    // println!("{:?}", witness);
+    // panic!("done");
+
     // Read the last argument as a command
-    let command = std::env::args().last().unwrap();
+    let command = std::env::args().last().expect("need a command");
 
     match command.as_str() {
         "start_index" => {
@@ -257,4 +276,15 @@ fn main() {
             info!("No command found");
         }
     }
+
+    // let txs = app.db.get("194229".to_string()).expect("get txs");
+    // if let Some(txs) = txs {
+    //     let set =
+    //         ciborium::from_reader::<HashSet<Transaction>, _>(txs.as_ref()).expect("from reader");
+    //     info!("total txs: {}", set.len());
+    //     // print txids
+    //     set.iter().for_each(|tx| {
+    //         info!("txid: {}", tx.compute_txid());
+    //     });
+    // }
 }
