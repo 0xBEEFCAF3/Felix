@@ -5,6 +5,7 @@ use bitcoin::{Block, Transaction, Witness};
 use bitcoincore_rpc::{Auth, Client as BitcoinRpc, RawTx, RpcApi};
 use ciborium;
 use clap::Parser;
+use plotters::prelude::*;
 
 use log::{info, trace};
 use sled::Db;
@@ -13,7 +14,7 @@ use sled::Db;
 const OP_CAT: u8 = 0x7e;
 /// Sled key for checkpoint
 const CHECKPOINT_SLED_KEY: &str = "CHECKPOINT";
-/// tip - BLOCK_DEPTH is when the indexer will stop indexing
+/// tip - BLOCK_DEPTH is when the indexer will stop. This is to avoid reorgs
 /// even signet reorgs
 const BLOCK_DEPTH: u64 = 6;
 
@@ -41,14 +42,8 @@ struct Args {
     #[arg(long, default_value = "193536")]
     start_block: u64,
 
-    #[arg(long, default_value = "false")]
-    start_index: bool,
-
-    #[arg(long, default_value = "false")]
-    get_checkpoint: bool,
-
-    #[arg(long, default_value = "false")]
-    get_total_cat_txs: bool,
+    #[arg()]
+    command: String,
 }
 
 struct App {
@@ -99,6 +94,7 @@ impl App {
         let mut bytes = Vec::new();
         ciborium::into_writer(&height, &mut bytes)?;
         self.db.insert(CHECKPOINT_SLED_KEY, bytes)?;
+        self.db.flush()?;
 
         Ok(())
     }
@@ -128,6 +124,7 @@ impl App {
         let mut bytes = Vec::new();
         ciborium::into_writer(&set, &mut bytes)?;
         self.db.insert(height.to_string(), bytes)?;
+        self.db.flush()?;
 
         Ok(())
     }
@@ -168,6 +165,60 @@ impl App {
         }
         Ok(total_cats)
     }
+
+    fn get_cats_starting_from(&self, height: u64) -> Result<Vec<u64>> {
+        let mut total_cats = vec![];
+        let tip = self.bitcoind_rpc.get_block_count()? - BLOCK_DEPTH;
+        for i in height..tip {
+            if let Some(txs) = self.db.get(i.to_string())? {
+                let set = ciborium::from_reader::<HashSet<Transaction>, _>(txs.as_ref())?;
+                total_cats.push(set.len() as u64);
+            }
+        }
+        Ok(total_cats)
+    }
+
+    fn create_plots(&self) -> Result<()> {
+        let tip = self.bitcoind_rpc.get_block_count()? - BLOCK_DEPTH;
+        let height_range = (self.start_block as i32)..(tip as i32);
+        let total_cats = self.get_cats_starting_from(self.start_block)?;
+        let root = BitMapBackend::new("output/total_cat_txs.png", (640, 480)).into_drawing_area();
+        root.fill(&WHITE)?;
+        let mut chart = ChartBuilder::on(&root)
+            .caption("CATS over time", ("sans-serif", 50).into_font())
+            .margin(10)
+            .x_label_area_size(30)
+            .y_label_area_size(40)
+            .build_cartesian_2d(height_range.clone(), 0..1000)?;
+
+        chart
+            .configure_mesh()
+            .x_desc("block heights")
+            .y_desc("txs using CAT")
+            .draw()?;
+
+        let binding = total_cats.iter().map(|c| *c as i32).collect::<Vec<i32>>();
+        let heights = height_range.clone().into_iter().collect::<Vec<i32>>();
+        let cats_to_plot: Vec<(i32, i32)> = binding
+            .iter()
+            .zip(heights.iter())
+            .map(|(c, h)| (*h, *c))
+            .collect();
+
+        chart
+            .draw_series(LineSeries::new(cats_to_plot, &RED))?
+            .label("Txs using CAT")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+
+        chart
+            .configure_series_labels()
+            .background_style(&WHITE.mix(0.8))
+            .border_style(&BLACK)
+            .draw()?;
+
+        root.present()?;
+        Ok(())
+    }
 }
 
 fn witness_includes_cat(witness: &Witness) -> bool {
@@ -183,15 +234,27 @@ fn main() {
 
     let args = Args::parse();
     let mut app = App::new(args.clone());
-    if args.start_index {
-        app.start_index().expect("start indexing");
-    } else if args.get_checkpoint {
-        let checkpoint = app.retrieve_check_point().expect("get checkpoint");
-        let tip = app.bitcoind_rpc.get_block_count().expect("get block count");
-        info!("checkpoint: {}", checkpoint);
-        info!("tip: {}", tip);
-    } else if args.get_total_cat_txs {
-        let total_cats = app.get_total_cat_txs().expect("get total cat txs");
-        info!("total cat txs: {}", total_cats);
+
+    // Read the last argument as a command
+    let command = std::env::args().last().unwrap();
+
+    match command.as_str() {
+        "start_index" => {
+            app.start_index().expect("start indexing");
+        }
+        "get_checkpoint" => {
+            let checkpoint = app.retrieve_check_point().expect("get checkpoint");
+            let tip = app.bitcoind_rpc.get_block_count().expect("get block count");
+            info!("checkpoint: {}", checkpoint);
+            info!("tip: {}", tip);
+        }
+        "get_total_cat_txs" => {
+            let total_cats = app.get_total_cat_txs().expect("get total cat txs");
+            info!("total cat txs: {}", total_cats);
+        }
+        "plot" => app.create_plots().expect("create plots"),
+        _ => {
+            info!("No command found");
+        }
     }
 }
