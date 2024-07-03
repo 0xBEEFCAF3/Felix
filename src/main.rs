@@ -5,7 +5,7 @@ use bitcoin::{Block, Script, Transaction, Witness};
 use bitcoincore_rpc::{Auth, Client as BitcoinRpc, RpcApi};
 use ciborium;
 use clap::Parser;
-use log::info;
+use log::{debug, info};
 use plotters::prelude::*;
 use sled::Db;
 
@@ -132,7 +132,7 @@ impl App {
 
     fn parse_block(&mut self, height: u64, block: Block) -> Result<()> {
         info!("parsing block height: {}", height);
-        info!("total txs in block: {}", block.txdata.len());
+        debug!("total txs in block: {}", block.txdata.len());
         let mut cat_count = 0;
         for tx in block.txdata.iter() {
             for input in tx.input.iter() {
@@ -238,22 +238,6 @@ fn main() {
     let args = Args::parse();
     let mut app = App::new(args.clone());
 
-    // let tx = app
-    //     .bitcoind_rpc
-    //     .get_raw_transaction(
-    //         &Txid::from_str("f7db5fd1d1355448dfb0f4b956257b65e648855ba89d74f7e5dded3f7d7eec91")
-    //             .unwrap(),
-    //         None,
-    //     )
-    //     .expect("get tx");
-
-    // let witness = tx.input[0].witness.clone();
-    // let res = witness_includes_cat(&witness);
-    // println!("{:?}", res);
-
-    // println!("{:?}", witness);
-    // panic!("done");
-
     // Read the last argument as a command
     let command = std::env::args().last().expect("need a command");
 
@@ -276,15 +260,4 @@ fn main() {
             info!("No command found");
         }
     }
-
-    // let txs = app.db.get("194229".to_string()).expect("get txs");
-    // if let Some(txs) = txs {
-    //     let set =
-    //         ciborium::from_reader::<HashSet<Transaction>, _>(txs.as_ref()).expect("from reader");
-    //     info!("total txs: {}", set.len());
-    //     // print txids
-    //     set.iter().for_each(|tx| {
-    //         info!("txid: {}", tx.compute_txid());
-    //     });
-    // }
 }
