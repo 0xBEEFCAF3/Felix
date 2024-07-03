@@ -24,3 +24,7 @@ Cargo.lock
 
 db/
 output/
+
+## python stuff
+
+.venv/

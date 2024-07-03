@@ -7,6 +7,7 @@ use ciborium;
 use clap::Parser;
 use log::{debug, info};
 use plotters::prelude::*;
+use serde::{Deserialize, Serialize};
 use sled::Db;
 
 /// Sled key for checkpoint
@@ -45,6 +46,16 @@ struct Args {
 
     #[arg()]
     command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TransactionExt {
+    height: u64,
+    // human readable tapscript, per input
+    scripts_asm: String,
+    // tapscript as hex, per input
+    scripts_hex: String,
+    tx: Transaction,
 }
 
 struct App {
@@ -182,6 +193,44 @@ impl App {
         Ok(total_cats)
     }
 
+    fn generate_cat_report(&self) -> Result<()> {
+        // One giant vec of TransactionExt for all blocks
+        let mut all_txs = vec![];
+        let checkpoint = self.retrieve_check_point()?;
+        
+        // let start_block = self.start_block;
+        let start_block = checkpoint - 100;
+        for i in start_block..checkpoint {
+            if let Some(txs) = self.db.get(i.to_string())? {
+                let set = ciborium::from_reader::<HashSet<Transaction>, _>(txs.as_ref())?;
+                for tx in set.iter() {
+                    let mut scripts_asm = String::new();
+                    let mut scripts_hex = String::new();
+                    for input in tx.input.iter() {
+                        // Some inputs will not include CAT but at least one will
+                        // lets include all of them 
+                        let tapscript = Script::from_bytes(input.witness.nth(input.witness.len() - 2).expect("witness"));
+                        scripts_asm.push_str(&tapscript.to_asm_string());
+                        scripts_hex.push_str(&tapscript.to_hex_string());
+                    }
+                    all_txs.push(TransactionExt {
+                        height: i,
+                        scripts_asm,
+                        scripts_hex,
+                        tx: tx.clone(),
+                    });
+                }
+            }
+        }
+
+        // write to a json file
+        let json = serde_json::to_string(&all_txs)?;
+        std::fs::write("output/cat_txs.json", json)?;
+
+
+        Ok(())
+    }
+
     fn create_plots(&self) -> Result<()> {
         let tip = self.bitcoind_rpc.get_block_count()? - BLOCK_DEPTH;
         let height_range = (self.start_block as i32)..(tip as i32);
@@ -217,6 +266,7 @@ impl App {
     }
 }
 
+
 fn witness_includes_cat(witness: &Witness) -> bool {
     // get the second to last element in the witness which should be the tapscript
     // ignoring all annex things
@@ -225,6 +275,9 @@ fn witness_includes_cat(witness: &Witness) -> bool {
     }
 
     let tapscript = Script::from_bytes(witness.nth(witness.len() - 2).expect("witness"));
+    // Is there a better way to do this?
+    // If we just iterate over the individual opcodes its possible but then we have to make sure
+    // we skip the data portion of any datapush opcodes -- seems more work than just checking for "CAT" str
     tapscript.to_asm_string().contains("OP_CAT")
 }
 
@@ -256,6 +309,7 @@ fn main() {
             info!("total cat txs: {}", total_cats);
         }
         "plot" => app.create_plots().expect("create plots"),
+        "generate_report" => app.generate_cat_report().expect("generate report"),
         _ => {
             info!("No command found");
         }
