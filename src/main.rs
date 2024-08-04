@@ -51,10 +51,12 @@ struct Args {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TransactionExt {
     height: u64,
+    // tx size
+    size: u64,
     // human readable tapscript, per input
-    scripts_asm: String,
+    scripts_asm: Vec<String>,
     // tapscript as hex, per input
-    scripts_hex: String,
+    scripts_hex: Vec<String>,
     tx: Transaction,
 }
 
@@ -66,7 +68,6 @@ struct App {
 
 impl App {
     fn new(args: Args) -> Self {
-        info!(">>>>> args: {:?}", args);
         let auth = Auth::UserPass(args.bitcoind_username, args.bitcoind_password);
         let bitcoind_rpc = BitcoinRpc::new(
             format!("http://{}:{}", args.bitcoind_url, args.bitcoind_port).as_str(),
@@ -194,29 +195,35 @@ impl App {
     }
 
     fn generate_cat_report(&self) -> Result<()> {
+        info!("generating report");
         // One giant vec of TransactionExt for all blocks
         let mut all_txs = vec![];
         let checkpoint = self.retrieve_check_point()?;
-        
+
         // let start_block = self.start_block;
-        let start_block = checkpoint - 100;
+        let start_block = checkpoint - 1000;
         for i in start_block..checkpoint {
             if let Some(txs) = self.db.get(i.to_string())? {
                 let set = ciborium::from_reader::<HashSet<Transaction>, _>(txs.as_ref())?;
                 for tx in set.iter() {
-                    let mut scripts_asm = String::new();
-                    let mut scripts_hex = String::new();
+                    let mut scripts_asm = vec![];
+                    let mut scripts_hex = vec![];
                     for input in tx.input.iter() {
                         // Some inputs will not include CAT but at least one will
-                        // lets include all of them 
-                        let tapscript = Script::from_bytes(input.witness.nth(input.witness.len() - 2).expect("witness"));
-                        scripts_asm.push_str(&tapscript.to_asm_string());
-                        scripts_hex.push_str(&tapscript.to_hex_string());
+                        // lets include all of them
+                        let tapscript = Script::from_bytes(
+                            input.witness.nth(input.witness.len() - 2).expect("witness"),
+                        );
+                        if tapscript.to_asm_string().contains("OP_CAT") {
+                            scripts_asm.push(tapscript.to_asm_string());
+                            scripts_hex.push(tapscript.to_hex_string());
+                        }
                     }
                     all_txs.push(TransactionExt {
                         height: i,
                         scripts_asm,
                         scripts_hex,
+                        size: tx.total_size() as u64,
                         tx: tx.clone(),
                     });
                 }
@@ -225,8 +232,9 @@ impl App {
 
         // write to a json file
         let json = serde_json::to_string(&all_txs)?;
-        std::fs::write("output/cat_txs.json", json)?;
-
+        let file_name = format!("output/cat_txs.json");
+        std::fs::write(file_name.clone(), json)?;
+        info!("report generated to {}", file_name);
 
         Ok(())
     }
@@ -265,7 +273,6 @@ impl App {
         Ok(())
     }
 }
-
 
 fn witness_includes_cat(witness: &Witness) -> bool {
     // get the second to last element in the witness which should be the tapscript
